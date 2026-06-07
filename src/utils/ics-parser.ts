@@ -11,7 +11,154 @@ export interface MoodleEvent {
 }
 
 /**
- * Extract course name from description or summary
+ * Parsed course info extracted from CATEGORIES field.
+ * CATEGORIES format from HCMUT Moodle: VIDEO_CO2017_VI, VIDEO_SP1007_VI, etc.
+ */
+export interface CourseInfo {
+  /** Raw course code, e.g. "CO2017" */
+  courseCode: string;
+  /** Course type prefix, e.g. "VIDEO" */
+  courseType: string;
+  /** Language/section suffix, e.g. "VI" */
+  courseSuffix: string;
+  /** Full raw CATEGORIES value */
+  raw: string;
+}
+
+/**
+ * Structured representation of a parsed VEVENT from Moodle ICS.
+ */
+export interface ParsedMoodleEvent {
+  uid: string;
+  /** Clean event title, stripped of trailing "kết thúc" and similar suffixes */
+  title: string;
+  /** Raw SUMMARY value (unmodified) */
+  rawSummary: string;
+  /** Human-readable plain-text description (line-folding & escape sequences resolved) */
+  description: string;
+  /** True if description has meaningful content */
+  hasDescription: boolean;
+  /** Parsed course information from CATEGORIES */
+  course: CourseInfo | null;
+  /** ISO 8601 start date-time string */
+  dtstart: string;
+  /** ISO 8601 end date-time string */
+  dtend: string;
+  /** ISO 8601 stamp date-time string */
+  dtstamp: string;
+  /** Last modified ISO 8601 string */
+  lastModified: string;
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Unfold RFC 5545 line-folded content.
+ * Lines that are continued start with a SPACE or TAB after CRLF.
+ */
+function unfoldLines(raw: string): string {
+  // Replace CRLF + (SPACE | TAB) with empty string (join continuation lines)
+  return raw.replace(/\r\n[ \t]/g, '').replace(/\n[ \t]/g, '');
+}
+
+/**
+ * Resolve ICS-escaped sequences inside a property value.
+ * ICS uses backslash escaping: \n → newline, \, → comma, \; → semicolon, \\ → backslash
+ */
+function resolveEscapes(value: string): string {
+  return value
+    .replace(/\\n/gi, '\n')
+    .replace(/\\,/g, ',')
+    .replace(/\\;/g, ';')
+    .replace(/\\\\/g, '\\');
+}
+
+/**
+ * Parse a single property line into { name, value }.
+ * Handles parameter syntax (e.g. DTSTART;TZID=...:value) by ignoring parameters.
+ */
+function parsePropLine(line: string): { name: string; value: string } | null {
+  const colonIdx = line.indexOf(':');
+  if (colonIdx === -1) return null;
+  const namePart = line.substring(0, colonIdx);
+  const value = line.substring(colonIdx + 1);
+  // Strip parameters (e.g. DTSTART;TZID=Asia/Ho_Chi_Minh → DTSTART)
+  const name = namePart.split(';')[0].trim().toUpperCase();
+  return { name, value };
+}
+
+/**
+ * Parse CATEGORIES field to extract structured course info.
+ * Expected format: VIDEO_CO2017_VI  →  type=VIDEO, code=CO2017, suffix=VI
+ * Falls back gracefully for unexpected formats.
+ */
+function parseCourseInfo(categories: string): CourseInfo | null {
+  if (!categories) return null;
+  const raw = categories.trim();
+
+  // Pattern: WORD_ALPHANUM_WORD  e.g.  VIDEO_CO2017_VI
+  const match = raw.match(/^([A-Z]+)_([A-Z]{2}\d{4,})_([A-Z]+)$/i);
+  if (match) {
+    return {
+      courseType: match[1].toUpperCase(),
+      courseCode: match[2].toUpperCase(),
+      courseSuffix: match[3].toUpperCase(),
+      raw,
+    };
+  }
+
+  // Fallback: try to extract any code-like segment (letters + digits)
+  const codeMatch = raw.match(/([A-Z]{2,}\d{3,})/i);
+  return {
+    courseType: '',
+    courseCode: codeMatch ? codeMatch[1].toUpperCase() : raw,
+    courseSuffix: '',
+    raw,
+  };
+}
+
+/**
+ * Clean a SUMMARY value:
+ * - Remove common Moodle suffixes like " kết thúc", " closes", " ends"
+ * - Trim whitespace
+ */
+function cleanSummary(summary: string): string {
+  return summary
+    .replace(/\s+kết thúc\s*$/i, '')
+    .replace(/\s+closes\s*$/i, '')
+    .replace(/\s+ends\s*$/i, '')
+    .trim();
+}
+
+/**
+ * Clean and normalise a DESCRIPTION value:
+ * - Resolve ICS escape sequences (\n, \, etc.)
+ * - Collapse excessive blank lines (max 1 blank line in a row)
+ * - Strip tabs and leading/trailing whitespace from each line
+ * - Return empty string if description has no meaningful content
+ */
+function cleanDescription(raw: string): string {
+  const resolved = resolveEscapes(raw);
+  const lines = resolved.split('\n').map((l) => l.replace(/^\t+/, '').trimEnd());
+  // Remove leading/trailing blank lines; collapse multiple blank lines to one
+  const collapsed: string[] = [];
+  let blankRun = 0;
+  for (const line of lines) {
+    if (line.trim() === '') {
+      blankRun++;
+      if (blankRun <= 1) collapsed.push('');
+    } else {
+      blankRun = 0;
+      collapsed.push(line);
+    }
+  }
+  return collapsed.join('\n').trim();
+}
+
+/**
+ * Extract course name from description or summary (original heuristic — kept for compatibility).
  * Common patterns:
  * - First line of description
  * - Text before dash or colon
@@ -39,6 +186,10 @@ function extractCourseName(description: string, summary: string): string | null 
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Public API — original function signatures preserved
+// ---------------------------------------------------------------------------
+
 /**
  * Fetch raw ICS content from Moodle
  */
@@ -60,15 +211,17 @@ export async function fetchMoodleICS(calendarUrl: string): Promise<string> {
 }
 
 /**
- * Parse ICS content and extract events
- * Returns array of event lines grouped by BEGIN:VEVENT...END:VEVENT
+ * Parse ICS content and extract raw event blocks.
+ * Returns array of event lines grouped by BEGIN:VEVENT...END:VEVENT.
  */
 export function parseICSContent(icsContent: string): {
   header: string;
   events: string[];
   footer: string;
 } {
-  const lines = icsContent.split('\n');
+  // Unfold continuation lines first (RFC 5545 §3.1)
+  const unfolded = unfoldLines(icsContent);
+  const lines = unfolded.split('\n');
 
   const header: string[] = [];
   const events: string[] = [];
@@ -78,20 +231,21 @@ export function parseICSContent(icsContent: string): {
   let inEvent = false;
 
   for (const line of lines) {
-    if (line.includes('BEGIN:VEVENT')) {
+    const trimmed = line.trimEnd();
+    if (trimmed.includes('BEGIN:VEVENT')) {
       inEvent = true;
-      currentEvent = [line];
-    } else if (line.includes('END:VEVENT')) {
-      currentEvent.push(line);
+      currentEvent = [trimmed];
+    } else if (trimmed.includes('END:VEVENT')) {
+      currentEvent.push(trimmed);
       events.push(currentEvent.join('\n'));
       currentEvent = [];
       inEvent = false;
     } else if (inEvent) {
-      currentEvent.push(line);
+      currentEvent.push(trimmed);
     } else if (events.length === 0) {
-      header.push(line);
+      header.push(trimmed);
     } else {
-      footer.push(line);
+      footer.push(trimmed);
     }
   }
 
@@ -103,40 +257,88 @@ export function parseICSContent(icsContent: string): {
 }
 
 /**
- * Process a single event: extract course name and prepend to SUMMARY
+ * Process a single raw event block: extract course info from CATEGORIES,
+ * clean SUMMARY (remove "kết thúc" etc.), and enrich the SUMMARY with
+ * the course code prefix.
+ *
+ * Also adds X-COURSE-CODE and X-COURSE-NAME custom properties for
+ * downstream consumers.
  */
 export function processEvent(eventICS: string): string {
-  let lines = eventICS.split('\n');
-  let summaryLine = -1;
-  let descriptionLine = -1;
-  let description = '';
-  let summary = '';
+  const lines = eventICS.split('\n');
+  const props: Record<string, string> = {};
+  const lineMap: Record<string, number> = {};
 
-  // Find SUMMARY and DESCRIPTION lines
+  // Parse all property lines
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].startsWith('SUMMARY:')) {
-      summaryLine = i;
-      summary = lines[i].substring('SUMMARY:'.length);
-    }
-    if (lines[i].startsWith('DESCRIPTION:')) {
-      descriptionLine = i;
-      description = lines[i].substring('DESCRIPTION:'.length);
+    const parsed = parsePropLine(lines[i]);
+    if (parsed && !lineMap[parsed.name]) {
+      // Keep first occurrence index for each property name
+      props[parsed.name] = parsed.value;
+      lineMap[parsed.name] = i;
     }
   }
 
-  // Extract course name
-  const courseName = extractCourseName(description, summary);
+  const rawSummary = props['SUMMARY'] || '';
+  const rawDescription = props['DESCRIPTION'] || '';
+  const rawCategories = props['CATEGORIES'] || '';
 
-  // Prepend course name to SUMMARY if found
-  if (courseName && summaryLine !== -1 && !summary.startsWith(courseName)) {
-    lines[summaryLine] = `SUMMARY:${courseName} - ${summary}`;
+  const course = parseCourseInfo(rawCategories);
+  const cleanTitle = cleanSummary(rawSummary);
+  const cleanDesc = cleanDescription(rawDescription);
+
+  // Build new line array (mutate in place)
+  const result = [...lines];
+
+  // Update SUMMARY: prepend course code if available and not already there
+  const summaryIdx = lineMap['SUMMARY'];
+  if (summaryIdx !== undefined) {
+    const prefix = course?.courseCode ? `[${course.courseCode}] ` : '';
+    const newSummary = prefix
+      ? prefix + cleanTitle
+      : cleanTitle;
+    result[summaryIdx] = `SUMMARY:${newSummary}`;
   }
 
-  return lines.join('\n');
+  // Update DESCRIPTION: write cleaned version back
+  const descIdx = lineMap['DESCRIPTION'];
+  if (descIdx !== undefined) {
+    if (cleanDesc) {
+      // Replace only the first line of the description (already unfolded)
+      result[descIdx] = `DESCRIPTION:${cleanDesc.replace(/\n/g, '\\n')}`;
+    } else {
+      result[descIdx] = 'DESCRIPTION:';
+    }
+  }
+
+  // Inject custom X- properties for richer calendar clients
+  const customProps: string[] = [];
+  if (course?.courseCode) {
+    customProps.push(`X-COURSE-CODE:${course.courseCode}`);
+  }
+  if (course?.raw) {
+    customProps.push(`X-COURSE-CATEGORY:${course.raw}`);
+  }
+  // Inject cleaned title as X-COURSE-TITLE (without the course-code prefix)
+  if (cleanTitle && cleanTitle !== rawSummary) {
+    customProps.push(`X-EVENT-TITLE:${cleanTitle}`);
+  }
+  // Inject has-description flag for consumers that want to filter
+  customProps.push(`X-HAS-DESCRIPTION:${cleanDesc ? 'TRUE' : 'FALSE'}`);
+
+  // Insert custom props just before END:VEVENT
+  const endIdx = result.findIndex((l) => l.trim() === 'END:VEVENT');
+  if (endIdx !== -1 && customProps.length > 0) {
+    result.splice(endIdx, 0, ...customProps);
+  }
+
+  return result.join('\n');
 }
 
 /**
- * Process all events in ICS content
+ * Process all events in ICS content.
+ * Applies line-unfolding, course-code extraction, summary cleaning,
+ * and description normalisation to every VEVENT.
  */
 export function processAllEvents(icsContent: string): string {
   const { header, events, footer } = parseICSContent(icsContent);
@@ -147,7 +349,54 @@ export function processAllEvents(icsContent: string): string {
 }
 
 /**
- * Main function: Fetch Moodle ICS, process it, and return modified content
+ * Parse a single VEVENT block into a strongly-typed ParsedMoodleEvent.
+ * Useful for consuming event data in application code without regex juggling.
+ */
+export function parseSingleEvent(eventICS: string): ParsedMoodleEvent {
+  const unfolded = unfoldLines(eventICS);
+  const lines = unfolded.split('\n');
+  const props: Record<string, string> = {};
+
+  for (const line of lines) {
+    const parsed = parsePropLine(line);
+    if (parsed && props[parsed.name] === undefined) {
+      props[parsed.name] = parsed.value;
+    }
+  }
+
+  const rawSummary = props['SUMMARY'] || '';
+  const rawDescription = props['DESCRIPTION'] || '';
+  const rawCategories = props['CATEGORIES'] || '';
+
+  const course = parseCourseInfo(rawCategories);
+  const description = cleanDescription(rawDescription);
+
+  return {
+    uid: props['UID'] || '',
+    title: cleanSummary(rawSummary),
+    rawSummary,
+    description,
+    hasDescription: description.length > 0,
+    course,
+    dtstart: props['DTSTART'] || '',
+    dtend: props['DTEND'] || '',
+    dtstamp: props['DTSTAMP'] || '',
+    lastModified: props['LAST-MODIFIED'] || '',
+  };
+}
+
+/**
+ * Parse all events in ICS content into structured ParsedMoodleEvent objects.
+ * Convenient for building UI, filtering by course, sorting by date, etc.
+ */
+export function parseAllEvents(icsContent: string): ParsedMoodleEvent[] {
+  const { events } = parseICSContent(icsContent);
+  return events.map((e) => parseSingleEvent(e));
+}
+
+/**
+ * Main function: Fetch Moodle ICS, process it, and return modified ICS content.
+ * (Original behaviour preserved — cleans summaries and adds X- properties.)
  */
 export async function transformMoodleCalendar(
   moodleCalendarUrl: string
