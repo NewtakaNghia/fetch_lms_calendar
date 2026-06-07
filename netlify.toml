@@ -1,0 +1,12 @@
+[build]
+  # Lệnh biên dịch TypeScript sang JavaScript
+  command = "npm run build"
+  # Thư mục chứa functions sau khi biên dịch
+  functions = "netlify/functions"
+  publish = "."
+
+# Chuyển hướng mọi request (ví dụ: your-domain.netlify.app/api/calendar) vào hàm api
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/api"
+  status = 200
