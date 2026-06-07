@@ -257,82 +257,168 @@ export function parseICSContent(icsContent: string): {
 }
 
 /**
- * Process a single raw event block: extract course info from CATEGORIES,
- * clean SUMMARY (remove "kết thúc" etc.), and enrich the SUMMARY with
- * the course code prefix.
+ * Fold a long ICS property value to comply with RFC 5545 §3.1 (max 75 octets per line).
+ * Continuation lines start with a single SPACE.
+ */
+function foldLine(line: string): string {
+  // Work in bytes to respect the 75-octet limit
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(line);
+  if (bytes.length <= 75) return line;
+
+  const decoder = new TextDecoder();
+  const result: string[] = [];
+  let offset = 0;
+  let first = true;
+
+  while (offset < bytes.length) {
+    const limit = first ? 75 : 74; // continuation lines lose 1 byte for the leading SPACE
+    let end = offset + limit;
+    if (end >= bytes.length) {
+      result.push((first ? '' : ' ') + decoder.decode(bytes.slice(offset)));
+      break;
+    }
+    // Don't split in the middle of a multi-byte UTF-8 sequence
+    while (end > offset && (bytes[end] & 0xc0) === 0x80) end--;
+    result.push((first ? '' : ' ') + decoder.decode(bytes.slice(offset, end)));
+    offset = end;
+    first = false;
+  }
+
+  return result.join('\r\n');
+}
+
+/**
+ * Escape a plain-text string for use as an ICS property value.
+ * Per RFC 5545: backslash, semicolon, comma must be escaped; newlines become \n.
+ */
+function escapeICSValue(text: string): string {
+  return text
+    .replace(/\\/g, '\\\\')
+    .replace(/;/g, '\\;')
+    .replace(/,/g, '\\,')
+    .replace(/\r\n|\r|\n/g, '\\n');
+}
+
+/**
+ * Build the DESCRIPTION block that Google Calendar will show in the event detail.
  *
- * Also adds X-COURSE-CODE and X-COURSE-NAME custom properties for
- * downstream consumers.
+ * Layout (all sections are optional — only emitted when data exists):
+ *
+ *   📚 Môn học: CO2017
+ *   ──────────────────
+ *   <original description content>
+ *   ──────────────────
+ *   🏷️ Danh mục: VIDEO_CO2017_VI
+ */
+function buildEnrichedDescription(
+  course: CourseInfo | null,
+  cleanDesc: string,
+): string {
+  const sections: string[] = [];
+
+  // --- Header block: course metadata ---
+  if (course?.courseCode) {
+    const meta: string[] = [];
+    meta.push(`📚 Môn học: ${course.courseCode}`);
+    sections.push(meta.join('\n'));
+  }
+
+  // --- Separator + original description ---
+  if (cleanDesc) {
+    if (sections.length > 0) sections.push('──────────────────');
+    sections.push(cleanDesc);
+  }
+
+  // --- Footer: raw category tag ---
+  if (course?.raw) {
+    sections.push('──────────────────');
+    sections.push(`🏷️ Danh mục: ${course.raw}`);
+  }
+
+  return sections.join('\n');
+}
+
+/**
+ * Process a single raw event block:
+ * - Extracts course code from CATEGORIES (e.g. VIDEO_CO2017_VI → CO2017)
+ * - Cleans SUMMARY: removes trailing "kết thúc" / "closes" / "ends",
+ *   then prepends [COURSE_CODE] so Google Calendar shows it in the title
+ * - Rewrites DESCRIPTION with a structured block containing course code,
+ *   the original description text, and the raw category — all visible in
+ *   Google Calendar's event detail popup
+ * - Keeps X- custom properties for any downstream client that reads them
  */
 export function processEvent(eventICS: string): string {
   const lines = eventICS.split('\n');
   const props: Record<string, string> = {};
   const lineMap: Record<string, number> = {};
 
-  // Parse all property lines
+  // Parse all property lines, recording the first occurrence of each name
   for (let i = 0; i < lines.length; i++) {
     const parsed = parsePropLine(lines[i]);
-    if (parsed && !lineMap[parsed.name]) {
-      // Keep first occurrence index for each property name
+    if (parsed && lineMap[parsed.name] === undefined) {
       props[parsed.name] = parsed.value;
       lineMap[parsed.name] = i;
     }
   }
 
-  const rawSummary = props['SUMMARY'] || '';
+  const rawSummary    = props['SUMMARY']     || '';
   const rawDescription = props['DESCRIPTION'] || '';
-  const rawCategories = props['CATEGORIES'] || '';
+  const rawCategories  = props['CATEGORIES']  || '';
 
-  const course = parseCourseInfo(rawCategories);
+  const course     = parseCourseInfo(rawCategories);
   const cleanTitle = cleanSummary(rawSummary);
-  const cleanDesc = cleanDescription(rawDescription);
+  const cleanDesc  = cleanDescription(rawDescription);
 
-  // Build new line array (mutate in place)
   const result = [...lines];
 
-  // Update SUMMARY: prepend course code if available and not already there
+  // ── SUMMARY ──────────────────────────────────────────────────────────────
+  // Format: "[CO2017] Quiz 9.1"  — visible as the event title in Google Cal
   const summaryIdx = lineMap['SUMMARY'];
   if (summaryIdx !== undefined) {
-    const prefix = course?.courseCode ? `[${course.courseCode}] ` : '';
-    const newSummary = prefix
-      ? prefix + cleanTitle
-      : cleanTitle;
-    result[summaryIdx] = `SUMMARY:${newSummary}`;
+    const prefix    = course?.courseCode ? `[${course.courseCode}] ` : '';
+    const newSummary = prefix + cleanTitle;
+    result[summaryIdx] = foldLine(`SUMMARY:${newSummary}`);
   }
 
-  // Update DESCRIPTION: write cleaned version back
+  // ── DESCRIPTION ──────────────────────────────────────────────────────────
+  // Build a human-readable block; embed it as the ICS DESCRIPTION value so
+  // Google Calendar displays it in the event detail panel.
   const descIdx = lineMap['DESCRIPTION'];
+  const enrichedDesc = buildEnrichedDescription(course, cleanDesc);
+
   if (descIdx !== undefined) {
-    if (cleanDesc) {
-      // Replace only the first line of the description (already unfolded)
-      result[descIdx] = `DESCRIPTION:${cleanDesc.replace(/\n/g, '\\n')}`;
+    // Replace the existing DESCRIPTION line (already unfolded) with the
+    // new enriched content, properly escaped and re-folded.
+    if (enrichedDesc) {
+      result[descIdx] = foldLine(`DESCRIPTION:${escapeICSValue(enrichedDesc)}`);
     } else {
       result[descIdx] = 'DESCRIPTION:';
     }
+  } else if (enrichedDesc) {
+    // No DESCRIPTION line existed — insert one before END:VEVENT
+    const endIdx = result.findIndex((l) => l.trim() === 'END:VEVENT');
+    if (endIdx !== -1) {
+      result.splice(endIdx, 0, foldLine(`DESCRIPTION:${escapeICSValue(enrichedDesc)}`));
+    }
   }
 
-  // Inject custom X- properties for richer calendar clients
+  // ── X- properties ────────────────────────────────────────────────────────
+  // Kept for clients that understand custom ICS properties (e.g. custom apps).
   const customProps: string[] = [];
-  if (course?.courseCode) {
-    customProps.push(`X-COURSE-CODE:${course.courseCode}`);
-  }
-  if (course?.raw) {
-    customProps.push(`X-COURSE-CATEGORY:${course.raw}`);
-  }
-  // Inject cleaned title as X-COURSE-TITLE (without the course-code prefix)
-  if (cleanTitle && cleanTitle !== rawSummary) {
+  if (course?.courseCode)  customProps.push(`X-COURSE-CODE:${course.courseCode}`);
+  if (course?.raw)         customProps.push(`X-COURSE-CATEGORY:${course.raw}`);
+  if (cleanTitle !== rawSummary.replace(/\s+kết thúc\s*$/i, '').trim())
     customProps.push(`X-EVENT-TITLE:${cleanTitle}`);
-  }
-  // Inject has-description flag for consumers that want to filter
   customProps.push(`X-HAS-DESCRIPTION:${cleanDesc ? 'TRUE' : 'FALSE'}`);
 
-  // Insert custom props just before END:VEVENT
   const endIdx = result.findIndex((l) => l.trim() === 'END:VEVENT');
   if (endIdx !== -1 && customProps.length > 0) {
     result.splice(endIdx, 0, ...customProps);
   }
 
-  return result.join('\n');
+  return result.join('\r\n');
 }
 
 /**
